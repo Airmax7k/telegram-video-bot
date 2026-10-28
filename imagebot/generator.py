@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import random
 import re
@@ -88,9 +89,16 @@ class PollinationsProvider(ImageProvider):
     name = "pollinations"
     BASE_URL = "https://image.pollinations.ai/prompt/"
 
+    # L'offre gratuite limite à ~1 image toutes les 15 s (402/429 avec Retry-After)
+    # et renvoie parfois 502/503/504 quand elle est surchargée
+    RATE_LIMIT_CODES = {402, 429, 502, 503, 504}
+    MAX_RETRIES = 4
+    MAX_WAIT = 30.0
+
     def __init__(self, model: str = "flux", timeout: float = 120.0):
         self.model = model
         self.timeout = timeout
+        self._lock = asyncio.Lock()
 
     async def generate(self, req: ImageRequest) -> bytes:
         width, height = req.dimensions
@@ -102,11 +110,25 @@ class PollinationsProvider(ImageProvider):
             "nologo": "true",
         }
         url = self.BASE_URL + quote(req.full_prompt(), safe="")
-        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
-            resp = await client.get(url, params=params)
+        # Une seule génération à la fois pour respecter la limite de l'offre gratuite
+        async with self._lock, httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
+            for attempt in range(self.MAX_RETRIES + 1):
+                resp = await client.get(url, params=params)
+                if resp.status_code not in self.RATE_LIMIT_CODES or attempt == self.MAX_RETRIES:
+                    break
+                await asyncio.sleep(self._retry_delay(resp))
+        if resp.status_code in self.RATE_LIMIT_CODES:
+            raise GenerationError("Le service gratuit est très sollicité, réessaie dans une minute.")
         if resp.status_code != 200 or not resp.headers.get("content-type", "").startswith("image/"):
             raise GenerationError(f"Le service d'images a répondu {resp.status_code}. Réessaie dans un instant.")
         return resp.content
+
+    def _retry_delay(self, resp: httpx.Response) -> float:
+        try:
+            delay = float(resp.headers.get("retry-after", 15))
+        except ValueError:
+            delay = 15.0
+        return min(max(delay, 1.0), self.MAX_WAIT) + 1.0
 
 
 class OpenAIProvider(ImageProvider):

@@ -18,6 +18,7 @@ from telegram.ext import (
 )
 
 from imagebot.generator import SIZES, STYLES, GenerationError, ImageProvider, build_provider, parse_prompt
+from imagebot.video import ffmpeg_available, generate_video, images_to_video
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -28,6 +29,7 @@ HELP_TEXT = (
     "Envoie simplement une description et je crée l'image !\n\n"
     "*Commandes*\n"
     "/imagine `<description>` — générer une image\n"
+    "/video `<description>` — générer une courte vidéo animée\n"
     "/style — choisir un style par défaut\n"
     "/taille — choisir le format (carré, portrait, paysage)\n"
     "/help — afficher cette aide\n\n"
@@ -74,10 +76,60 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await query.message.reply_text("Je n'ai plus la dernière description, renvoie-la moi.")
             return
         await _generate(update, context, prompt)
+    elif kind == "animate":
+        await _animate_last(update, context)
 
 
 async def imagine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _generate(update, context, " ".join(context.args))
+
+
+async def video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if not _allowed(update, context):
+        await message.reply_text("⛔ Tu n'es pas autorisé à utiliser ce bot.")
+        return
+    try:
+        req = parse_prompt(" ".join(context.args), context.user_data.get("style"), context.user_data.get("taille", "carre"))
+    except GenerationError as e:
+        await message.reply_text(f"⚠️ {e}")
+        return
+
+    status = await message.reply_text("🎬 Création de la vidéo (environ 30 à 60 secondes)…")
+    await context.bot.send_chat_action(message.chat_id, ChatAction.UPLOAD_VIDEO)
+    try:
+        clip = await generate_video(context.bot_data["provider"], req)
+    except GenerationError as e:
+        await status.edit_text(f"❌ {e}")
+        return
+    except Exception:
+        log.exception("Échec de vidéo pour %r", req.prompt)
+        await status.edit_text("❌ Une erreur inattendue est survenue, réessaie plus tard.")
+        return
+    await message.reply_video(video=clip, caption=req.prompt[:900], supports_streaming=True)
+    await status.delete()
+
+
+async def _animate_last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    last = context.user_data.get("last_image")
+    if not last:
+        await message.reply_text("Je n'ai plus la dernière image, génère-en une nouvelle.")
+        return
+    image, size = last
+    status = await message.reply_text("🎬 Animation de l'image…")
+    await context.bot.send_chat_action(message.chat_id, ChatAction.UPLOAD_VIDEO)
+    try:
+        clip = await images_to_video([image], size, seconds_per_image=5)
+    except GenerationError as e:
+        await status.edit_text(f"❌ {e}")
+        return
+    except Exception:
+        log.exception("Échec de l'animation")
+        await status.edit_text("❌ Une erreur inattendue est survenue, réessaie plus tard.")
+        return
+    await message.reply_video(video=clip, supports_streaming=True)
+    await status.delete()
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -112,7 +164,11 @@ async def _generate(update: Update, context: ContextTypes.DEFAULT_TYPE, text: st
     caption = req.prompt[:900]
     if req.style:
         caption += f"\n🎭 {req.style}"
-    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Nouvelle variante", callback_data="regen:1")]])
+    context.user_data["last_image"] = (image, req.size)
+    buttons = [InlineKeyboardButton("🔄 Nouvelle variante", callback_data="regen:1")]
+    if ffmpeg_available():
+        buttons.append(InlineKeyboardButton("🎬 Animer", callback_data="animate:1"))
+    keyboard = InlineKeyboardMarkup([buttons])
     await message.reply_photo(photo=image, caption=caption, reply_markup=keyboard)
     await status.delete()
 
@@ -130,12 +186,15 @@ def main() -> None:
     app.bot_data.update(provider=provider, allowed_users=allowed)
     app.add_handler(CommandHandler(["start", "help"], start))
     app.add_handler(CommandHandler("imagine", imagine))
+    app.add_handler(CommandHandler("video", video))
     app.add_handler(CommandHandler("style", choose_style))
     app.add_handler(CommandHandler("taille", choose_size))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     log.info("Bot démarré avec le moteur %s", provider.name)
+    if not ffmpeg_available():
+        log.warning("ffmpeg introuvable : les vidéos sont désactivées")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

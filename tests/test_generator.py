@@ -37,3 +37,24 @@ def test_build_provider():
         build_provider("openai", {})
     with pytest.raises(ValueError):
         build_provider("inconnu", {})
+
+
+def test_pollinations_retries_when_rate_limited(monkeypatch):
+    import asyncio
+
+    import httpx
+
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(402, headers={"retry-after": "0"})
+        return httpx.Response(200, headers={"content-type": "image/jpeg"}, content=b"img")
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw))
+    monkeypatch.setattr(PollinationsProvider, "_retry_delay", lambda self, resp: 0)
+
+    assert asyncio.run(PollinationsProvider().generate(parse_prompt("un chat"))) == b"img"
+    assert len(calls) == 2
